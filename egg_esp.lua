@@ -1,15 +1,13 @@
-
-
 local CONFIG = {
     DEBUG          = false,
-    MAX_DISTANCE   = math.huge,   -- hide eggs farther than this
+    MAX_DISTANCE   = math.huge,
     TEXT_SIZE      = 16,
-    OUTLINE        = false,       -- Highlight is laggy with many eggs
+    OUTLINE        = false,
     NAME_MATCH     = "egg",
-    UPDATE_RATE    = 0.15,        -- seconds between label updates
-    DATA_RATE      = 1,           -- seconds between re-reading Kg/rarity
+    UPDATE_RATE    = 0.15,
+    DATA_RATE      = 1,
     IGNORE_NAMES   = { eggs = true, eggfolder = true, eggs_folder = true },
-    WEIGHT_KEYS    = { "Weight", "Kg", "KG", "Mass", "Size", "EggWeight" },
+    WEIGHT_KEYS    = { "Weight", "Kg", "KG", "Mass", "EggWeight", "BaseWeight", "PetWeight" },
     RARITY_KEYS    = { "Rarity", "Tier", "Type" },
 }
 
@@ -17,8 +15,7 @@ local RARITY_COLORS = {
     common = Color3.fromRGB(190,190,190), uncommon = Color3.fromRGB(100,220,100),
     rare = Color3.fromRGB(80,150,255),    epic = Color3.fromRGB(180,90,255),
     legendary = Color3.fromRGB(255,190,40), mythic = Color3.fromRGB(255,80,120),
-    celestial = Color3.fromRGB(255,200,60),
-    secret = Color3.fromRGB(255,255,255),
+    celestial = Color3.fromRGB(255,200,60), secret = Color3.fromRGB(255,255,255),
 }
 
 local Players, RunService, CoreGui = game:GetService("Players"), game:GetService("RunService"), game:GetService("CoreGui")
@@ -30,14 +27,13 @@ local container = Instance.new("Folder")
 container.Name = "EggESP"
 container.Parent = (gethui and gethui()) or CoreGui
 
-local tracked, conns = {}, {}   -- tracked[rootEgg] = data
+local tracked, conns = {}, {}
 
 local function matches(inst)
     local n = string.lower(inst.Name)
     return string.find(n, CONFIG.NAME_MATCH, 1, true) ~= nil and not CONFIG.IGNORE_NAMES[n]
 end
 
--- A "container" holds several eggs (e.g. a model with many egg children)
 local function isContainer(m)
     local c = 0
     for _, ch in ipairs(m:GetChildren()) do
@@ -49,7 +45,6 @@ local function isContainer(m)
     return false
 end
 
--- Walk up to the OUTERMOST single-egg model so parts/meshes never get their own ESP
 local function resolveRoot(inst)
     local top
     local cur = inst
@@ -63,6 +58,16 @@ local function resolveRoot(inst)
     return top
 end
 
+-- parse numbers from values/text: 123, "123.4", "1,234.5 KG"
+local function toNumber(v)
+    if type(v) == "number" then return v end
+    if type(v) == "string" then
+        local s = v:gsub(",", "")
+        local withUnit = string.match(s, "(%d+%.?%d*)%s*[Kk][Gg]")
+        return tonumber(withUnit) or tonumber(s)
+    end
+end
+
 local function readKey(obj, keys)
     for _, k in ipairs(keys) do
         local a = obj:GetAttribute(k)
@@ -72,43 +77,46 @@ local function readKey(obj, keys)
     end
 end
 
-local function parseKg(t) return tonumber(string.match(t or "", "([%d%.]+)%s*[Kk][Gg]")) end
-
-local WEIGHT_HINTS = { "weight", "kg", "mass", "size" }
-
 local function looksLikeWeight(name)
     name = string.lower(name)
-    for _, h in ipairs(WEIGHT_HINTS) do
-        if string.find(name, h, 1, true) then return true end
-    end
-    return false
+    return string.find(name, "weight", 1, true) or string.find(name, "kg", 1, true)
 end
 
 local function readData(model)
-    local kg, rarity
+    local kg, rarity, source
 
-    -- 1) exact keys on the egg itself
+    -- 1) exact keys on the egg itself (most reliable, per-egg data)
     local v = readKey(model, CONFIG.WEIGHT_KEYS)
-    if type(v) == "number" then kg = v elseif type(v) == "string" then kg = parseKg(v) or tonumber(v) end
+    kg = toNumber(v)
+    if kg then source = "egg key" end
     rarity = readKey(model, CONFIG.RARITY_KEYS)
 
-    -- 2) fuzzy search: any attribute / value / text that looks like weight
+    -- 2) search inside THIS egg only (attributes, values, text labels)
     if not kg or rarity == nil then
         local objs = model:GetDescendants()
         table.insert(objs, 1, model)
         for _, d in ipairs(objs) do
             if not kg then
-                for k, val in pairs(d:GetAttributes()) do
-                    if looksLikeWeight(k) then
-                        if type(val) == "number" then kg = val; break end
-                        if type(val) == "string" then kg = parseKg(val) or tonumber(val); if kg then break end end
+                -- exact keys on children
+                local ev = readKey(d, CONFIG.WEIGHT_KEYS)
+                if ev ~= nil and toNumber(ev) then kg = toNumber(ev); source = "child key " .. d.Name end
+                -- fuzzy attribute names
+                if not kg then
+                    for k, val in pairs(d:GetAttributes()) do
+                        if looksLikeWeight(k) and toNumber(val) then
+                            kg = toNumber(val); source = "attr " .. k; break
+                        end
                     end
                 end
-                if not kg and d:IsA("ValueBase") and looksLikeWeight(d.Name) and type(d.Value) == "number" then
-                    kg = d.Value
+                -- ValueObjects named like weight
+                if not kg and d:IsA("ValueBase") and looksLikeWeight(d.Name) and toNumber(d.Value) then
+                    kg = toNumber(d.Value); source = "value " .. d.Name
                 end
+                -- text that explicitly contains "kg"
                 if not kg and (d:IsA("TextLabel") or d:IsA("TextBox")) then
-                    kg = parseKg(d.Text)
+                    local s = string.gsub(d.Text or "", ",", "")
+                    local n = tonumber(string.match(s, "(%d+%.?%d*)%s*[Kk][Gg]"))
+                    if n then kg = n; source = "text " .. d.Name end
                 end
             end
             if rarity == nil then rarity = readKey(d, CONFIG.RARITY_KEYS) end
@@ -116,20 +124,8 @@ local function readData(model)
         end
     end
 
-    -- 3) fallback: Roblox physical mass of the egg
-    if not kg then
-        local ok, mass = pcall(function()
-            if model:IsA("BasePart") then return model.AssemblyMass end
-            local total = 0
-            for _, p in ipairs(model:GetDescendants()) do
-                if p:IsA("BasePart") then total += p:GetMass() end
-            end
-            return total
-        end)
-        if ok and mass and mass > 0 then kg = mass end
-    end
-
-    return kg, rarity and tostring(rarity) or "?"
+    -- NO physical-mass fallback: that's what made every egg show the same Kg.
+    return kg, rarity and tostring(rarity) or "?", source
 end
 
 local function debugDump(model)
@@ -156,7 +152,6 @@ local function track(inst)
     local part = root:IsA("BasePart") and root or root.PrimaryPart or root:FindFirstChildWhichIsA("BasePart", true)
     if not part then return end
 
-    -- remove any ESP previously made for a child/part of this egg
     for m in pairs(tracked) do
         if m ~= root and m:IsDescendantOf(root) then untrack(m) end
     end
@@ -189,12 +184,10 @@ local function track(inst)
     tracked[root] = { gui = gui, label = label, part = part, hl = hl, lastData = 0, lastText = "" }
 end
 
--- Initial scan
 for _, d in ipairs(workspace:GetDescendants()) do
     if matches(d) then track(d) end
 end
 
--- New spawns: only react to instances whose name matches (no thread spam)
 table.insert(conns, workspace.DescendantAdded:Connect(function(d)
     if matches(d) then
         task.delay(0.3, function() if d.Parent then track(d) end end)
@@ -204,7 +197,6 @@ table.insert(conns, workspace.DescendantRemoving:Connect(function(d)
     if tracked[d] then untrack(d) end
 end))
 
--- Throttled update loop
 local acc = 0
 table.insert(conns, RunService.Heartbeat:Connect(function(dt)
     acc += dt
@@ -222,8 +214,13 @@ table.insert(conns, RunService.Heartbeat:Connect(function(dt)
             t.gui.Enabled = show
             if show then
                 if now - t.lastData >= CONFIG.DATA_RATE then
-                    t.kg, t.rarity = readData(model)
+                    local src
+                    t.kg, t.rarity, src = readData(model)
                     t.lastData = now
+                    if CONFIG.DEBUG and src and src ~= t.src then
+                        t.src = src
+                        print("[EggESP]", model.Name, "Kg from", src, "=", t.kg)
+                    end
                 end
                 local text = string.format("%s | %s | %s Kg | %d studs",
                     string.upper(t.rarity or "?"), model.Name,
@@ -231,7 +228,7 @@ table.insert(conns, RunService.Heartbeat:Connect(function(dt)
                 if text ~= t.lastText then
                     t.label.Text = text
                     t.lastText = text
-                    local c = RARITY_COLORS[string.lower(t.rarity or "")] or Color3.new(1,1,1)
+                    local c = RARITY_COLORS[string.lower(t.rarity or "")] or Color3.new(1, 1, 1)
                     t.label.TextColor3 = c
                     if t.hl then t.hl.OutlineColor = c end
                 end
