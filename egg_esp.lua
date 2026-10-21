@@ -1,8 +1,4 @@
---[[
-  Egg ESP v2 - ONE label per egg, low lag
-  Format: RARITY | Egg Name | 123.4 Kg | 9 studs
-  DEBUG = true prints the data inside each egg (use if Kg shows "?").
-]]
+
 
 local CONFIG = {
     DEBUG          = false,
@@ -21,6 +17,7 @@ local RARITY_COLORS = {
     common = Color3.fromRGB(190,190,190), uncommon = Color3.fromRGB(100,220,100),
     rare = Color3.fromRGB(80,150,255),    epic = Color3.fromRGB(180,90,255),
     legendary = Color3.fromRGB(255,190,40), mythic = Color3.fromRGB(255,80,120),
+    celestial = Color3.fromRGB(255,200,60),
     secret = Color3.fromRGB(255,255,255),
 }
 
@@ -77,22 +74,61 @@ end
 
 local function parseKg(t) return tonumber(string.match(t or "", "([%d%.]+)%s*[Kk][Gg]")) end
 
+local WEIGHT_HINTS = { "weight", "kg", "mass", "size" }
+
+local function looksLikeWeight(name)
+    name = string.lower(name)
+    for _, h in ipairs(WEIGHT_HINTS) do
+        if string.find(name, h, 1, true) then return true end
+    end
+    return false
+end
+
 local function readData(model)
     local kg, rarity
+
+    -- 1) exact keys on the egg itself
     local v = readKey(model, CONFIG.WEIGHT_KEYS)
     if type(v) == "number" then kg = v elseif type(v) == "string" then kg = parseKg(v) or tonumber(v) end
     rarity = readKey(model, CONFIG.RARITY_KEYS)
+
+    -- 2) fuzzy search: any attribute / value / text that looks like weight
     if not kg or rarity == nil then
-        for _, d in ipairs(model:GetDescendants()) do
+        local objs = model:GetDescendants()
+        table.insert(objs, 1, model)
+        for _, d in ipairs(objs) do
             if not kg then
-                local w = readKey(d, CONFIG.WEIGHT_KEYS)
-                if type(w) == "number" then kg = w
-                elseif d:IsA("TextLabel") then kg = parseKg(d.Text) end
+                for k, val in pairs(d:GetAttributes()) do
+                    if looksLikeWeight(k) then
+                        if type(val) == "number" then kg = val; break end
+                        if type(val) == "string" then kg = parseKg(val) or tonumber(val); if kg then break end end
+                    end
+                end
+                if not kg and d:IsA("ValueBase") and looksLikeWeight(d.Name) and type(d.Value) == "number" then
+                    kg = d.Value
+                end
+                if not kg and (d:IsA("TextLabel") or d:IsA("TextBox")) then
+                    kg = parseKg(d.Text)
+                end
             end
             if rarity == nil then rarity = readKey(d, CONFIG.RARITY_KEYS) end
             if kg and rarity ~= nil then break end
         end
     end
+
+    -- 3) fallback: Roblox physical mass of the egg
+    if not kg then
+        local ok, mass = pcall(function()
+            if model:IsA("BasePart") then return model.AssemblyMass end
+            local total = 0
+            for _, p in ipairs(model:GetDescendants()) do
+                if p:IsA("BasePart") then total += p:GetMass() end
+            end
+            return total
+        end)
+        if ok and mass and mass > 0 then kg = mass end
+    end
+
     return kg, rarity and tostring(rarity) or "?"
 end
 
